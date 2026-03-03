@@ -396,6 +396,12 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        // IndexCache sparse attention metadata
+        int32_t const* sparse_n_indices = nullptr;
+        int32_t const* sparse_n_offsets = nullptr;
+        int32_t const* sparse_n_mask_counts = nullptr;
+        int sparse_num_m_blocks = 0;
+        int h_k = 0;  // number of KV heads (for sparse key computation)
     };
 
     // Device side kernel params
@@ -453,6 +459,12 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const *const seqlens_rotary = nullptr;
+        // IndexCache sparse attention metadata
+        int32_t const* sparse_n_indices = nullptr;
+        int32_t const* sparse_n_offsets = nullptr;
+        int32_t const* sparse_n_mask_counts = nullptr;
+        int sparse_num_m_blocks = 0;
+        int h_k = 0;
     };
 
     static Params
@@ -564,7 +576,9 @@ struct CollectiveMainloopFwdSm90 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
+                args.sparse_n_indices, args.sparse_n_offsets, args.sparse_n_mask_counts,
+                args.sparse_num_m_blocks, args.h_k};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -790,7 +804,30 @@ struct CollectiveMainloopFwdSm90 {
             pipeline_vt.consumer_release(smem_pipe_read);
         };
 
-        int n_block = n_block_max - 1;
+        // Sparse attention: compute iteration parameters
+        bool const is_sparse = params.sparse_n_indices != nullptr;
+        int sparse_base_offset = 0;
+        int num_n_iters = n_block_max - n_block_min;
+        if (is_sparse) {
+            uint32_t sparse_key = static_cast<uint32_t>(bidb) * params.h_k * params.sparse_num_m_blocks
+                                + static_cast<uint32_t>(bidh_kv) * params.sparse_num_m_blocks
+                                + static_cast<uint32_t>(m_block);
+            sparse_base_offset = params.sparse_n_offsets[sparse_key];
+            int sparse_end = params.sparse_n_offsets[sparse_key + 1];
+            num_n_iters = sparse_end - sparse_base_offset;
+            if (num_n_iters == 0) {
+                scheduler_prefetch();
+                return;
+            }
+        }
+        auto get_n_block = [&](int step) -> int {
+            return is_sparse
+                ? params.sparse_n_indices[sparse_base_offset + step]
+                : (n_block_max - 1 - step);
+        };
+
+        int step = 0;
+        int n_block = get_n_block(step);
 
         int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
         // If this is true, we're guaranteed that only the first warp will execute this function
@@ -856,9 +893,10 @@ struct CollectiveMainloopFwdSm90 {
             if (should_load_KV) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
         }
         int n_block_prev = n_block;
-        --n_block;
+        ++step;
         #pragma unroll (!Transpose_V && Use_TMA_KV ? 2 : 1)
-        for (; n_block >= n_block_min; --n_block) {
+        for (; step < num_n_iters; ++step) {
+            n_block = get_n_block(step);
             PipelineState smem_pipe_write_v = smem_pipe_write; // copy the state, write_v is always 1 step behind
             ++smem_pipe_write;
             if (should_load_KV) {
@@ -983,6 +1021,27 @@ struct CollectiveMainloopFwdSm90 {
             if (n_block_max <= n_block_min) { return false; }
         }
 
+        // Sparse attention: compute iteration parameters
+        bool const is_sparse_mma = params.sparse_n_indices != nullptr;
+        int sparse_base_offset_mma = 0;
+        int num_n_iters_mma = n_block_max - n_block_min;
+        int sparse_mask_count_mma = 0;
+        if (is_sparse_mma) {
+            uint32_t sparse_key = static_cast<uint32_t>(bidb) * params.h_k * params.sparse_num_m_blocks
+                                + static_cast<uint32_t>(bidh_kv) * params.sparse_num_m_blocks
+                                + static_cast<uint32_t>(m_block);
+            sparse_base_offset_mma = params.sparse_n_offsets[sparse_key];
+            int sparse_end = params.sparse_n_offsets[sparse_key + 1];
+            num_n_iters_mma = sparse_end - sparse_base_offset_mma;
+            sparse_mask_count_mma = params.sparse_n_mask_counts[sparse_key];
+            if (num_n_iters_mma == 0) { return false; }
+        }
+        auto get_n_block_mma = [&](int step) -> int {
+            return is_sparse_mma
+                ? params.sparse_n_indices[sparse_base_offset_mma + step]
+                : (n_block_max - 1 - step);
+        };
+
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
         Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{});
@@ -1057,7 +1116,8 @@ struct CollectiveMainloopFwdSm90 {
 
         int const seqlen_q = seqlen_info.seqlen_q;
         int const seqlen_k = seqlen_info.seqlen_k;
-        int n_block = n_block_max - 1;
+        int step_mma = 0;
+        int n_block = get_n_block_mma(step_mma);
 
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMmaQK> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
@@ -1161,6 +1221,7 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
             if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
             --n_block;
+            ++step_mma;
 
             // Need to initialize tOrO in the case of RescaleOBeforeGemm where we will scale tOrO even in the 1st iter
             clear(tOrO);
@@ -1206,31 +1267,50 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
             };
 
-            if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
-                auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
-                int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
-                    seqlen_info, m_block, n_block_min, params.window_size_right,
-                    params.attention_chunk_divmod, params.qhead_per_khead_divmod);
-                #pragma unroll 1
-                for (; n_block >= n_block_min_causal_local_mask; --n_block) {
-                    fwd_step(n_block, mask_fn, cute::true_type{} /*check_inf*/);
+            if (is_sparse_mma) {
+                // Sparse: two-phase iteration using pre-computed mask_count
+                if constexpr (Is_causal || Is_local) {
+                    auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+                    #pragma unroll 1
+                    for (; step_mma < sparse_mask_count_mma && step_mma < num_n_iters_mma; ++step_mma) {
+                        n_block = get_n_block_mma(step_mma);
+                        fwd_step(n_block, mask_fn, cute::true_type{} /*check_inf*/);
+                    }
                 }
-            }
-
-            int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
-                seqlen_info, m_block, n_block_min, params.window_size_left,
-                params.attention_chunk_divmod, params.qhead_per_khead_divmod);
-            auto no_mask_fn = [](auto& tSrS, int n_block) { };
-            #pragma unroll 1
-            for (; n_block >= n_block_min_before_local_mask; --n_block) {
-                fwd_step(n_block, no_mask_fn, cute::false_type{} /*check_inf*/);
-            }
-            // Separate masking iterations on the left for local attention
-            if constexpr (Is_local) {
-                auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+                auto no_mask_fn = [](auto& tSrS, int n_block) { };
                 #pragma unroll 1
-                for (; n_block >= n_block_min; --n_block) {
-                    fwd_step(n_block, local_mask_fn, cute::bool_constant<Is_local>{} /*check_inf*/);
+                for (; step_mma < num_n_iters_mma; ++step_mma) {
+                    n_block = get_n_block_mma(step_mma);
+                    fwd_step(n_block, no_mask_fn, cute::false_type{} /*check_inf*/);
+                }
+            } else {
+                // Dense: original three-phase iteration
+                if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
+                    auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+                    int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
+                        seqlen_info, m_block, n_block_min, params.window_size_right,
+                        params.attention_chunk_divmod, params.qhead_per_khead_divmod);
+                    #pragma unroll 1
+                    for (; n_block >= n_block_min_causal_local_mask; --n_block) {
+                        fwd_step(n_block, mask_fn, cute::true_type{} /*check_inf*/);
+                    }
+                }
+
+                int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
+                    seqlen_info, m_block, n_block_min, params.window_size_left,
+                    params.attention_chunk_divmod, params.qhead_per_khead_divmod);
+                auto no_mask_fn = [](auto& tSrS, int n_block) { };
+                #pragma unroll 1
+                for (; n_block >= n_block_min_before_local_mask; --n_block) {
+                    fwd_step(n_block, no_mask_fn, cute::false_type{} /*check_inf*/);
+                }
+                // Separate masking iterations on the left for local attention
+                if constexpr (Is_local) {
+                    auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+                    #pragma unroll 1
+                    for (; n_block >= n_block_min; --n_block) {
+                        fwd_step(n_block, local_mask_fn, cute::bool_constant<Is_local>{} /*check_inf*/);
+                    }
                 }
             }
             // Tell producers that smem_q is ready
@@ -1307,30 +1387,50 @@ struct CollectiveMainloopFwdSm90 {
             auto first_iter_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
             fwd_step(n_block, first_iter_mask_fn, cute::true_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
             --n_block;
-            if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
-                auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
-                int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
-                    seqlen_info, m_block, n_block_min, params.window_size_right,
-                    params.attention_chunk_divmod, params.qhead_per_khead_divmod);
-                #pragma unroll 1
-                for (; n_block >= n_block_min_causal_local_mask; --n_block) {
-                    fwd_step(n_block, mask_fn, cute::false_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
+            ++step_mma;
+            if (is_sparse_mma) {
+                // Sparse: two-phase iteration
+                if constexpr (Is_causal || Is_local) {
+                    auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+                    #pragma unroll 1
+                    for (; step_mma < sparse_mask_count_mma && step_mma < num_n_iters_mma; ++step_mma) {
+                        n_block = get_n_block_mma(step_mma);
+                        fwd_step(n_block, mask_fn, cute::false_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
+                    }
                 }
-            }
-            int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
-                seqlen_info, m_block, n_block_min, params.window_size_left,
-                params.attention_chunk_divmod, params.qhead_per_khead_divmod);
-            auto no_mask_fn = [](auto& tSrS, int n_block) { };
-            #pragma unroll 1
-            for (; n_block >= n_block_min_before_local_mask; --n_block) {
-                fwd_step(n_block, no_mask_fn, cute::false_type{} /*is_first_iter*/, cute::false_type{} /*check_inf*/);
-            }
-            // Separate masking iterations on the left for local attention
-            if constexpr (Is_local) {
-                auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+                auto no_mask_fn = [](auto& tSrS, int n_block) { };
                 #pragma unroll 1
-                for (; n_block >= n_block_min; --n_block) {
-                    fwd_step(n_block, local_mask_fn, cute::false_type{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
+                for (; step_mma < num_n_iters_mma; ++step_mma) {
+                    n_block = get_n_block_mma(step_mma);
+                    fwd_step(n_block, no_mask_fn, cute::false_type{} /*is_first_iter*/, cute::false_type{} /*check_inf*/);
+                }
+            } else {
+                // Dense: original three-phase iteration
+                if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
+                    auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+                    int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
+                        seqlen_info, m_block, n_block_min, params.window_size_right,
+                        params.attention_chunk_divmod, params.qhead_per_khead_divmod);
+                    #pragma unroll 1
+                    for (; n_block >= n_block_min_causal_local_mask; --n_block) {
+                        fwd_step(n_block, mask_fn, cute::false_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
+                    }
+                }
+                int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
+                    seqlen_info, m_block, n_block_min, params.window_size_left,
+                    params.attention_chunk_divmod, params.qhead_per_khead_divmod);
+                auto no_mask_fn = [](auto& tSrS, int n_block) { };
+                #pragma unroll 1
+                for (; n_block >= n_block_min_before_local_mask; --n_block) {
+                    fwd_step(n_block, no_mask_fn, cute::false_type{} /*is_first_iter*/, cute::false_type{} /*check_inf*/);
+                }
+                // Separate masking iterations on the left for local attention
+                if constexpr (Is_local) {
+                    auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+                    #pragma unroll 1
+                    for (; n_block >= n_block_min; --n_block) {
+                        fwd_step(n_block, local_mask_fn, cute::false_type{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
+                    }
                 }
             }
             warp_scheduler_barrier_arrive();

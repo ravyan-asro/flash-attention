@@ -704,7 +704,10 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         std::optional<at::Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
-        int64_t sm_margin
+        int64_t sm_margin,
+        std::optional<at::Tensor> sparse_n_indices_,   // (total_sparse_blocks,) int32 - packed N-block indices
+        std::optional<at::Tensor> sparse_n_offsets_,    // (B * H_kv * num_m_blocks + 1,) int32 - offsets into indices
+        std::optional<at::Tensor> sparse_n_mask_counts_ // (B * H_kv * num_m_blocks,) int32 - causal mask counts per tile
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1143,6 +1146,27 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         } else {
             params.v_descale_ptr = nullptr;
         }
+    }
+
+    // Set sparse attention parameters (IndexCache)
+    if (sparse_n_indices_.has_value()) {
+        auto sparse_n_indices = sparse_n_indices_.value();
+        auto sparse_n_offsets = sparse_n_offsets_.value();
+        auto sparse_n_mask_counts = sparse_n_mask_counts_.value();
+        CHECK_DEVICE(sparse_n_indices);
+        CHECK_DEVICE(sparse_n_offsets);
+        CHECK_DEVICE(sparse_n_mask_counts);
+        CHECK_CONTIGUOUS(sparse_n_indices);
+        CHECK_CONTIGUOUS(sparse_n_offsets);
+        CHECK_CONTIGUOUS(sparse_n_mask_counts);
+        TORCH_CHECK(sparse_n_indices.dtype() == torch::kInt32, "sparse_n_indices must be int32");
+        TORCH_CHECK(sparse_n_offsets.dtype() == torch::kInt32, "sparse_n_offsets must be int32");
+        TORCH_CHECK(sparse_n_mask_counts.dtype() == torch::kInt32, "sparse_n_mask_counts must be int32");
+        int num_m_blocks_sparse = sparse_n_mask_counts.size(0) / (batch_size * num_heads_k);
+        params.sparse_n_indices = sparse_n_indices.data_ptr<int32_t>();
+        params.sparse_n_offsets = sparse_n_offsets.data_ptr<int32_t>();
+        params.sparse_n_mask_counts = sparse_n_mask_counts.data_ptr<int32_t>();
+        params.sparse_num_m_blocks = num_m_blocks_sparse;
     }
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
@@ -1705,7 +1729,10 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? scheduler_metadata = None,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
-        "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "int sm_margin = 0,"
+        "Tensor? sparse_n_indices = None,"
+        "Tensor? sparse_n_offsets = None,"
+        "Tensor? sparse_n_mask_counts = None) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"

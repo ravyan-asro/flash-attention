@@ -89,6 +89,9 @@ def _flash_attn_forward(
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
     sm_margin: int = 0,
+    sparse_n_indices: Optional[torch.Tensor] = None,
+    sparse_n_offsets: Optional[torch.Tensor] = None,
+    sparse_n_mask_counts: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
@@ -136,6 +139,9 @@ def _flash_attn_forward(
         num_splits,
         pack_gqa,
         sm_margin,
+        sparse_n_indices,
+        sparse_n_offsets,
+        sparse_n_mask_counts,
     )
 
     if out_accum is None:
@@ -183,6 +189,9 @@ def _flash_attn_forward_fake(
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
     sm_margin: int = 0,
+    sparse_n_indices: Optional[torch.Tensor] = None,
+    sparse_n_offsets: Optional[torch.Tensor] = None,
+    sparse_n_mask_counts: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Symbolic fake implementation of flash attention forward.
