@@ -401,7 +401,7 @@ struct CollectiveMainloopFwdSm90 {
         int32_t const* sparse_n_offsets = nullptr;
         int32_t const* sparse_n_mask_counts = nullptr;
         int sparse_num_m_blocks = 0;
-        int h_k = 0;  // number of KV heads (for sparse key computation)
+        int sparse_num_heads = 0;  // number of heads for sparse key computation (H_q for per-Q-head masks)
     };
 
     // Device side kernel params
@@ -464,7 +464,7 @@ struct CollectiveMainloopFwdSm90 {
         int32_t const* sparse_n_offsets = nullptr;
         int32_t const* sparse_n_mask_counts = nullptr;
         int sparse_num_m_blocks = 0;
-        int h_k = 0;
+        int sparse_num_heads = 0;
     };
 
     static Params
@@ -578,7 +578,7 @@ struct CollectiveMainloopFwdSm90 {
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
                 args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
                 args.sparse_n_indices, args.sparse_n_offsets, args.sparse_n_mask_counts,
-                args.sparse_num_m_blocks, args.h_k};
+                args.sparse_num_m_blocks, args.sparse_num_heads};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -809,8 +809,8 @@ struct CollectiveMainloopFwdSm90 {
         int sparse_base_offset = 0;
         int num_n_iters = n_block_max - n_block_min;
         if (is_sparse) {
-            uint32_t sparse_key = static_cast<uint32_t>(bidb) * params.h_k * params.sparse_num_m_blocks
-                                + static_cast<uint32_t>(bidh_kv) * params.sparse_num_m_blocks
+            uint32_t sparse_key = static_cast<uint32_t>(bidb) * params.sparse_num_heads * params.sparse_num_m_blocks
+                                + static_cast<uint32_t>(bidh) * params.sparse_num_m_blocks
                                 + static_cast<uint32_t>(m_block);
             sparse_base_offset = params.sparse_n_offsets[sparse_key];
             int sparse_end = params.sparse_n_offsets[sparse_key + 1];
@@ -1027,8 +1027,8 @@ struct CollectiveMainloopFwdSm90 {
         int num_n_iters_mma = n_block_max - n_block_min;
         int sparse_mask_count_mma = 0;
         if (is_sparse_mma) {
-            uint32_t sparse_key = static_cast<uint32_t>(bidb) * params.h_k * params.sparse_num_m_blocks
-                                + static_cast<uint32_t>(bidh_kv) * params.sparse_num_m_blocks
+            uint32_t sparse_key = static_cast<uint32_t>(bidb) * params.sparse_num_heads * params.sparse_num_m_blocks
+                                + static_cast<uint32_t>(bidh) * params.sparse_num_m_blocks
                                 + static_cast<uint32_t>(m_block);
             sparse_base_offset_mma = params.sparse_n_offsets[sparse_key];
             int sparse_end = params.sparse_n_offsets[sparse_key + 1];

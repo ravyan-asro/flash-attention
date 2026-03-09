@@ -187,35 +187,41 @@ def build_indexcache_metadata(
     page_size: int = 128,
     device: str = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert IndexCache metadata to FA3 sparse packed arrays.
+    """Convert IndexCache metadata to FA3 sparse packed arrays (per-Q-head).
 
     Args:
         seqlen_total: total sequence length (context + question) = seqlen_q = seqlen_k.
         offset_list: cumulative token lengths per document (NOT zero-prefixed).
                      E.g., [512, 1024, 1536] for 3 docs of 512 tokens each.
         question_len: number of question tokens appended after context.
-        kvcolidx_cache: (1, H, total_kv_indices) int64 — global page indices, -1=invalid.
+        kvcolidx_cache: (1, H_q, total_kv_indices) int64 — global page indices,
+                        -1=invalid.  H_q = number of Q heads.
                         Pages from non-last documents only.
-        la_hot_tile_code_cache: (1, H, total_bytes) uint8 — bit-packed LA mask, all docs.
-        num_heads_kv: number of KV heads.
+        la_hot_tile_code_cache: (1, H_q, total_bytes) uint8 — bit-packed LA mask,
+                                all docs.
+        num_heads_kv: number of KV heads (unused — kept for API compat).
+                      Metadata is emitted per-Q-head; the FA3 kernel indexes
+                      by bidh (Q head) directly.
         kBlockM, kBlockN: FA3 tile sizes.
         page_size: IndexCache page size (should match kBlockN for 1:1 mapping).
         device: target device.
 
     Returns:
         (sparse_n_indices, sparse_n_offsets, sparse_n_mask_counts)
+        Sized for B * H_q * num_m_blocks (per-Q-head, NOT per-KV-head).
     """
     assert page_size > 0
     seqlen_q = seqlen_total
     seqlen_k = seqlen_total
     context_len = seqlen_total - question_len
 
+    num_heads_q = kvcolidx_cache.shape[1]
+
     # Document boundaries (in tokens, zero-prefixed)
     doc_token_starts = [0]
     for off in offset_list:
         doc_token_starts.append(off)
     num_docs = len(offset_list)
-    # doc d covers tokens [doc_token_starts[d], doc_token_starts[d+1])
 
     # Document page boundaries
     doc_page_starts = [0]
@@ -233,20 +239,16 @@ def build_indexcache_metadata(
         la_byte_starts.append(la_byte_starts[-1] + num_bytes)
 
     # kvcolidx boundaries per doc (non-last docs only)
-    # offset_list cumulative → doc lengths
     doc_lengths = []
     prev = 0
     for off in offset_list:
         doc_lengths.append(off - prev)
         prev = off
 
-    # For each doc d (0..num_docs-2), kvcolidx has num_pages_d entries
-    # The kvcolidx_cache is concatenated across non-last docs
     kvcol_starts = [0]
     for d in range(num_docs - 1):
         np = math.ceil(doc_lengths[d] / page_size)
         kvcol_starts.append(kvcol_starts[-1] + np)
-    # Last doc has 0 kvcolidx entries
 
     num_m_blocks = math.ceil(seqlen_q / kBlockM)
     pages_per_n_block = max(1, kBlockN // page_size)
@@ -256,20 +258,18 @@ def build_indexcache_metadata(
     all_offsets: List[int] = [0]
     all_mask_counts: List[int] = []
 
-    kvcolidx_cpu = kvcolidx_cache.cpu().long()  # (1, H, total_kv_indices)
-    la_code_cpu = la_hot_tile_code_cache.cpu()    # (1, H, total_bytes)
+    kvcolidx_cpu = kvcolidx_cache.cpu().long()  # (1, H_q, total_kv_indices)
+    la_code_cpu = la_hot_tile_code_cache.cpu()    # (1, H_q, total_bytes)
 
-    for h in range(num_heads_kv):
+    # Per-Q-head: iterate over all Q heads directly
+    for h_q in range(num_heads_q):
         for m in range(num_m_blocks):
-            # Which tokens does this m_block cover?
             q_start = m * kBlockM
             q_end = min((m + 1) * kBlockM, seqlen_q)
-            q_mid = (q_start + q_end) // 2  # representative token
+            q_mid = (q_start + q_end) // 2
 
-            # Determine which region q_mid is in
             in_question = q_mid >= context_len
 
-            # Find which document q_mid belongs to (if in context)
             doc_idx = -1
             if not in_question:
                 for d in range(num_docs):
@@ -280,23 +280,20 @@ def build_indexcache_metadata(
             n_block_set = set()
 
             if in_question:
-                # Question region: full causal attention to all preceding tokens
                 causal_max = _causal_n_block_max(m, kBlockM, kBlockN,
                                                  seqlen_q, seqlen_k,
                                                  math.ceil(seqlen_k / kBlockN))
                 for nb in range(causal_max):
                     n_block_set.add(nb)
             else:
-                # Context region for document doc_idx
                 # --- CA: selected KV pages from docs before doc_idx ---
                 if doc_idx > 0:
                     ca_start = kvcol_starts[0]
                     ca_end = kvcol_starts[min(doc_idx, len(kvcol_starts) - 1)]
                     for ci in range(ca_start, ca_end):
                         if ci < kvcolidx_cpu.shape[2]:
-                            page_idx = kvcolidx_cpu[0, h, ci].item()
+                            page_idx = kvcolidx_cpu[0, h_q, ci].item()
                             if page_idx >= 0:
-                                # Convert global page index to N-block
                                 if page_size == kBlockN:
                                     n_block_set.add(page_idx)
                                 elif page_size < kBlockN:
@@ -311,11 +308,10 @@ def build_indexcache_metadata(
                 doc_num_pages = doc_page_starts[doc_idx + 1] - doc_page_starts[doc_idx]
                 la_byte_start = la_byte_starts[doc_idx]
                 la_byte_end = la_byte_starts[doc_idx + 1]
-                la_bytes = la_code_cpu[0, h, la_byte_start:la_byte_end]
+                la_bytes = la_code_cpu[0, h_q, la_byte_start:la_byte_end]
 
                 hot_pairs = _decode_la_hot_tile_code(la_bytes, doc_num_pages)
 
-                # Which row pages does this m_block cover?
                 m_block_page_start = (q_start - doc_token_starts[doc_idx]) // page_size
                 m_block_page_end = min(
                     (q_end - 1 - doc_token_starts[doc_idx]) // page_size + 1,
@@ -324,7 +320,6 @@ def build_indexcache_metadata(
 
                 for row_page, col_page in hot_pairs:
                     if m_block_page_start <= row_page < m_block_page_end:
-                        # This tile is relevant to this m_block
                         global_page = doc_start_page + col_page
                         if page_size == kBlockN:
                             n_block_set.add(global_page)
@@ -354,13 +349,6 @@ def build_indexcache_metadata(
             all_indices.extend(n_blocks_desc)
             all_offsets.append(len(all_indices))
             all_mask_counts.append(mask_count)
-
-    # Replicate across batch (metadata is per (head, m_block) — same for all batches)
-    if kvcolidx_cache.shape[0] == 1:
-        # Single batch — just use as-is
-        pass
-    else:
-        raise NotImplementedError("Multi-batch IndexCache metadata not yet supported")
 
     return (
         torch.tensor(all_indices, dtype=torch.int32, device=device),

@@ -164,10 +164,11 @@ struct Flash_fwd_params : public Qkv_params {
     bool prepare_varlen_pdl;
 
     // IndexCache sparse attention metadata (nullptr when not using sparse)
-    int32_t const* sparse_n_indices = nullptr;     // packed N-block indices per (batch, head, m_block)
-    int32_t const* sparse_n_offsets = nullptr;      // offsets into sparse_n_indices
-    int32_t const* sparse_n_mask_counts = nullptr;  // per (batch, head, m_block): how many N-blocks need causal mask
-    int sparse_num_m_blocks = 0;                    // total M-blocks per (batch, head) for offset computation
+    // Indexed per Q-head: (batch, q_head, m_block) — each Q head has its own sparse mask
+    int32_t const* sparse_n_indices = nullptr;     // packed N-block indices per (batch, q_head, m_block)
+    int32_t const* sparse_n_offsets = nullptr;      // offsets into sparse_n_indices; size = B * H_q * num_m_blocks + 1
+    int32_t const* sparse_n_mask_counts = nullptr;  // per (batch, q_head, m_block): how many N-blocks need causal mask
+    int sparse_num_m_blocks = 0;                    // total M-blocks per (batch, q_head) for offset computation
 
     int arch;
     int num_sm;
