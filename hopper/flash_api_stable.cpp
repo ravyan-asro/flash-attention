@@ -773,7 +773,10 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         std::optional<Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
-        int64_t sm_margin
+        int64_t sm_margin,
+        std::optional<Tensor> sparse_n_indices_,
+        std::optional<Tensor> sparse_n_offsets_,
+        std::optional<Tensor> sparse_n_mask_counts_
         ) {
 
     auto dprops = get_device_prop();
@@ -1210,6 +1213,21 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         } else {
             params.v_descale_ptr = nullptr;
         }
+    }
+
+    // Set sparse attention parameters (IndexCache)
+    if (sparse_n_indices_.has_value()) {
+        auto sparse_n_indices = sparse_n_indices_.value();
+        auto sparse_n_offsets = sparse_n_offsets_.value();
+        auto sparse_n_mask_counts = sparse_n_mask_counts_.value();
+        CHECK_DEVICE(sparse_n_indices);
+        CHECK_DEVICE(sparse_n_offsets);
+        CHECK_DEVICE(sparse_n_mask_counts);
+        int num_m_blocks_sparse = sparse_n_mask_counts.size(0) / (batch_size * num_heads);
+        params.sparse_n_indices = static_cast<int32_t*>(sparse_n_indices.data_ptr());
+        params.sparse_n_offsets = static_cast<int32_t*>(sparse_n_offsets.data_ptr());
+        params.sparse_n_mask_counts = static_cast<int32_t*>(sparse_n_mask_counts.data_ptr());
+        params.sparse_num_m_blocks = num_m_blocks_sparse;
     }
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
@@ -1791,8 +1809,11 @@ void boxed_mha_fwd(
     auto num_splits = to<int64_t>(stack[31]);
     auto pack_gqa = to<std::optional<bool>>(stack[32]);
     auto sm_margin = to<int64_t>(stack[33]);
+    auto sparse_n_indices = to<std::optional<Tensor>>(stack[34]);
+    auto sparse_n_offsets = to<std::optional<Tensor>>(stack[35]);
+    auto sparse_n_mask_counts = to<std::optional<Tensor>>(stack[36]);
 
-    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, sm_margin);
+    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, sm_margin, sparse_n_indices, sparse_n_offsets, sparse_n_mask_counts);
 
 
     stack[0] = from(out_);
@@ -1924,7 +1945,10 @@ STABLE_TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? scheduler_metadata = None,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
-        "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "int sm_margin = 0,"
+        "Tensor? sparse_n_indices = None,"
+        "Tensor? sparse_n_offsets = None,"
+        "Tensor? sparse_n_mask_counts = None) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"
