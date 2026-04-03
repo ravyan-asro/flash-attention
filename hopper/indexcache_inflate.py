@@ -1,14 +1,17 @@
 """
-indexcache_inflate.py — v2
+indexcache_inflate.py — v3
 
 Converts compact IndexCache metadata → FA3 sparse packed arrays on GPU.
 Processes ALL layers in a single kernel launch.
 
+v3: kvcolidx is now uint8 bit-packed (MSB-first, byte-aligned per document),
+    same format as la_hot_tile_code.
+
 Public API:
     build_indexcache_metadata_gpu_all_layers(
         seqlen_total, offset_list, question_len,
-        kvcolidx_per_layer,          # list[Tensor] or stacked Tensor
-        la_hot_tile_code_per_layer,  # list[Tensor] or stacked Tensor
+        kvcolidx_per_layer,          # list[Tensor] or stacked Tensor (uint8)
+        la_hot_tile_code_per_layer,  # list[Tensor] or stacked Tensor (uint8)
         device="cuda",
     ) -> list[(sparse_n_indices, sparse_n_offsets, sparse_n_mask_counts)]
 
@@ -47,15 +50,18 @@ def _get_module():
 def _build_aux_tensors(offset_list, page_size, device):
     num_docs = len(offset_list)
 
+    # Document token boundaries (cumulative → per-doc)
     doc_token_starts = [0]
     for off in offset_list:
         doc_token_starts.append(off)
 
+    # doc_page_offsets: cumulative page counts (all docs)
     doc_page_list = [0]
     for d in range(num_docs):
         doc_len = doc_token_starts[d + 1] - doc_token_starts[d]
         doc_page_list.append(doc_page_list[-1] + math.ceil(doc_len / page_size))
 
+    # la_byte_offsets: cumulative LA bytes per doc
     la_byte_list = [0]
     for d in range(num_docs):
         doc_len = doc_token_starts[d + 1] - doc_token_starts[d]
@@ -63,21 +69,30 @@ def _build_aux_tensors(offset_list, page_size, device):
         num_tiles = np_ * (np_ + 1) // 2
         la_byte_list.append(la_byte_list[-1] + (num_tiles + 7) // 8)
 
+    # Per-doc page counts and byte offsets for kvcolidx (docs 0..N-2 only)
     doc_lengths = []
     prev = 0
     for off in offset_list:
         doc_lengths.append(off - prev)
         prev = off
 
-    kvcol_list = [0]
+    # kvcol_page_counts: real page count per CA doc (for masking padding bits)
+    kvcol_page_counts_list = []
     for d in range(num_docs - 1):
-        kvcol_list.append(kvcol_list[-1] + math.ceil(doc_lengths[d] / page_size))
+        kvcol_page_counts_list.append(math.ceil(doc_lengths[d] / page_size))
 
-    doc_page_offsets = torch.tensor(doc_page_list, dtype=torch.int32, device=device)
-    la_byte_offsets  = torch.tensor(la_byte_list,  dtype=torch.int32, device=device)
-    kvcol_offsets    = torch.tensor(kvcol_list,     dtype=torch.int32, device=device)
+    # kvcol_byte_offsets: cumulative byte offsets per CA doc
+    kvcol_byte_list = [0]
+    for d in range(num_docs - 1):
+        n_pages = kvcol_page_counts_list[d]
+        kvcol_byte_list.append(kvcol_byte_list[-1] + (n_pages + 7) // 8)
 
-    return doc_page_offsets, la_byte_offsets, kvcol_offsets
+    doc_page_offsets    = torch.tensor(doc_page_list, dtype=torch.int32, device=device)
+    la_byte_offsets     = torch.tensor(la_byte_list,  dtype=torch.int32, device=device)
+    kvcol_byte_offsets  = torch.tensor(kvcol_byte_list, dtype=torch.int32, device=device)
+    kvcol_page_counts   = torch.tensor(kvcol_page_counts_list, dtype=torch.int32, device=device)
+
+    return doc_page_offsets, la_byte_offsets, kvcol_byte_offsets, kvcol_page_counts
 
 
 # ---------------------------------------------------------------------------
@@ -95,8 +110,8 @@ def build_indexcache_metadata_gpu_all_layers(
     """Process all layers in a single GPU kernel launch.
 
     Args:
-        kvcolidx_per_layer: list of (1, H_q, kv_cols) int64 per layer, OR
-                            pre-stacked (num_layers, H_q, kv_cols) tensor.
+        kvcolidx_per_layer: list of (1, H_q, kv_bytes) uint8 per layer, OR
+                            pre-stacked (num_layers, H_q, kv_bytes) tensor.
         la_hot_tile_code_per_layer: list of (1, H_q, la_bytes) uint8, OR
                                     pre-stacked (num_layers, H_q, la_bytes).
 
@@ -109,17 +124,16 @@ def build_indexcache_metadata_gpu_all_layers(
 
     # Stack layers into (num_layers, H_q, ...) if given as list
     if isinstance(kvcolidx_per_layer, list):
-        # Each is (1, H_q, cols) — squeeze batch dim, stack on dim 0
         kvcolidx_stacked = torch.stack(
             [t.squeeze(0) for t in kvcolidx_per_layer], dim=0
-        ).to(device)  # (num_layers, H_q, total_kv_indices)
+        ).to(device)
     else:
         kvcolidx_stacked = kvcolidx_per_layer.to(device)
 
     if isinstance(la_hot_tile_code_per_layer, list):
         la_stacked = torch.stack(
             [t.squeeze(0) for t in la_hot_tile_code_per_layer], dim=0
-        ).to(device)  # (num_layers, H_q, total_la_bytes)
+        ).to(device)
     else:
         la_stacked = la_hot_tile_code_per_layer.to(device)
 
@@ -127,14 +141,13 @@ def build_indexcache_metadata_gpu_all_layers(
     H_q = kvcolidx_stacked.shape[1]
     M = math.ceil(seqlen_total / kBlockN)
 
-    doc_page_offsets, la_byte_offsets, kvcol_offsets = _build_aux_tensors(
-        offset_list, PAGE_SIZE, device
-    )
+    doc_page_offsets, la_byte_offsets, kvcol_byte_offsets, kvcol_page_counts = \
+        _build_aux_tensors(offset_list, PAGE_SIZE, device)
 
     mod = _get_module()
     flat_indices, flat_offsets, flat_mask_counts = mod.build_indexcache_metadata_cuda(
         kvcolidx_stacked, la_stacked,
-        doc_page_offsets, la_byte_offsets, kvcol_offsets,
+        doc_page_offsets, la_byte_offsets, kvcol_byte_offsets, kvcol_page_counts,
         num_layers, seqlen_total, question_len, kBlockN,
     )
 
@@ -167,7 +180,7 @@ def build_indexcache_metadata_gpu(
     kvcolidx_cache: torch.Tensor,
     la_hot_tile_code_cache: torch.Tensor,
     device: str = "cuda",
-    **kwargs,  # accept and ignore num_heads_kv, kBlockM, kBlockN, page_size
+    **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single-layer drop-in replacement for build_indexcache_metadata()."""
     results = build_indexcache_metadata_gpu_all_layers(
